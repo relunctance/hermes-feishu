@@ -333,9 +333,10 @@ class FeishuGroupRule:
     """Per-group policy rule for controlling which users may interact with the bot."""
 
     policy: str  # "open" | "allowlist" | "blacklist" | "admin_only" | "disabled"
-	at_only: bool = True  # ← 新增：True=需要@，False=免@响应 added by hhue
+    at_only: bool = True  # ← 新增：True=需要@，False=免@响应 added by hhue
     allowlist: set[str] = field(default_factory=set)
     blacklist: set[str] = field(default_factory=set)
+    cross_bot_mentions: list[str] = field(default_factory=list)  # ← 新增：额外响应哪些bot名字（场景A）
 
 
 @dataclass
@@ -1174,6 +1175,7 @@ class FeishuAdapter(BasePlatformAdapter):
 					at_only=_to_boolean(rule_cfg.get("at_only", True)),  # ← 新增 added by hhue
                     allowlist=set(str(u).strip() for u in rule_cfg.get("allowlist", []) if str(u).strip()),
                     blacklist=set(str(u).strip() for u in rule_cfg.get("blacklist", []) if str(u).strip()),
+                    cross_bot_mentions=[str(b).strip() for b in rule_cfg.get("cross_bot_mentions", []) if str(b).strip()],
                 )
 
         # Bot-level admins
@@ -1982,6 +1984,9 @@ class FeishuAdapter(BasePlatformAdapter):
         message = getattr(event, "message", None)
         sender = getattr(event, "sender", None)
         sender_id = getattr(sender, "sender_id", None)
+        chat_type = getattr(message, "chat_type", "p2p") if message else "unknown"
+        chat_id = getattr(message, "chat_id", "") if message else ""
+        logger.debug("[Feishu] _handle_message_event_data: chat_type=%s chat_id=%s sender_id=%s", chat_type, chat_id, sender_id)
         if not message or not sender_id:
             logger.debug("[Feishu] Dropping malformed inbound event: missing message or sender_id")
             return
@@ -1997,7 +2002,7 @@ class FeishuAdapter(BasePlatformAdapter):
         chat_type = getattr(message, "chat_type", "p2p")
         chat_id = getattr(message, "chat_id", "") or ""
         if chat_type != "p2p" and not self._should_accept_group_message(message, sender_id, chat_id):
-            logger.debug("[Feishu] Dropping group message that failed mention/policy gate: %s", message_id)
+            logger.info("[Feishu] Dropping group message that failed mention/policy gate: chat_type=%s chat_id=%s sender_id=%s", chat_type, chat_id, sender_id)
             return
         await self._process_inbound_message(
             data=data,
@@ -3380,26 +3385,38 @@ class FeishuAdapter(BasePlatformAdapter):
 
     def _should_accept_group_message(self, message: Any, sender_id: Any, chat_id: str = "") -> bool:
         """Require an explicit @mention before group messages enter the agent.
-		
-		Per-group behavior:
+
+        Per-group behavior:
         - If group has a rule with policy="disabled": no response at all
         - If group has a rule with at_only=false: no @mention required
         - If group has a rule with at_only=true (default): @mention required
         - If no group rule: fallback to default behavior (@mention required)
-		"""
+        """
         if not self._allow_group_message(sender_id, chat_id):
             return False
-		# added by hhue in 2026-4-22 start=====================
-		# Check per-group at_only setting
-        rule = self._group_rules.get(chat_id) if chat_id else None
-        if rule:
-            # at_only=false means respond without @mention
-            if not rule.at_only:
-                return True
-            # at_only=true (default): fall through to @mention check below
-		# add by hhue in 2026-4-22 end=====================
 
-        # @_all is Feishu's @everyone placeholder — always route to the bot.
+        rule = self._group_rules.get(chat_id) if chat_id else None
+
+        # ── 场景B/C: at_only=false → 免@响应，但 cross_bot_mentions 仍需检查 ──
+        if rule and not rule.at_only:
+            # 群2(oc_629f...) at_only=false，任何消息都能进
+            # 检查是否有人 @ 了 cross_bot_mentions 列表里的机器人
+            if rule.cross_bot_mentions and self._mentions_cross_bot(message, rule.cross_bot_mentions):
+                logger.debug("[Feishu] Group %s: cross-bot mention detected, routing to bot", chat_id)
+            return True
+
+        # ── 场景A: at_only=true，必须 @ 机器人才响应 ──
+        if rule and rule.at_only:
+            # 检查是否 @ 了自己（gql-hermes）
+            if self._mentions_self_bot(message):
+                return True
+            # 检查是否 @ 了 cross_bot_mentions 列表里的机器人
+            if rule.cross_bot_mentions and self._mentions_cross_bot(message, rule.cross_bot_mentions):
+                logger.debug("[Feishu] Group %s: cross-bot mention detected", chat_id)
+                return True
+            return False
+
+        # ── 无 rule 兜底：默认必须 @ ──
         raw_content = getattr(message, "content", "") or ""
         if "@_all" in raw_content:
             return True
@@ -3412,6 +3429,46 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         if normalized.mentioned_ids:
             return self._post_mentions_bot(normalized.mentioned_ids)
+        return False
+
+    def _mentions_self_bot(self, message: Any) -> bool:
+        """检查消息是否 @ 了当前机器人自己（gql-hermes）。"""
+        mentions = getattr(message, "mentions", None) or []
+        if mentions:
+            return self._message_mentions_bot(mentions)
+        raw_content = getattr(message, "content", "") or ""
+        normalized = normalize_feishu_message(
+            message_type=getattr(message, "message_type", "") or "",
+            raw_content=raw_content,
+        )
+        if normalized.mentioned_ids:
+            return self._post_mentions_bot(normalized.mentioned_ids)
+        return False
+
+    def _mentions_cross_bot(self, message: Any, cross_bot_names: list[str]) -> bool:
+        """检查消息是否 @ 了 cross_bot_mentions 列表里的机器人（wk-hermes, bailong-hermes）。
+
+        群1: @wk-hermes → mention_name in ["wk-hermes", "bailong-hermes"]
+        群2: @wk-hermes/@gql-hermes/@bailong-hermes → mention_name in all known bots
+        """
+        if not cross_bot_names:
+            return False
+
+        # 方法1：从 structured mentions 提取被 @ 者的 name
+        mentions = getattr(message, "mentions", None) or []
+        for mention in mentions:
+            mention_name = (getattr(mention, "name", None) or "").strip()
+            if mention_name and mention_name in cross_bot_names:
+                return True
+
+        # 方法2：从 raw_content 文本匹配 @bot_name
+        raw_content = getattr(message, "content", "") or ""
+        for bot_name in cross_bot_names:
+            if f"@{bot_name}" in raw_content:
+                return True
+            if f"<at " in raw_content and bot_name in raw_content:
+                return True
+
         return False
 
     def _is_self_sent_bot_message(self, event: Any) -> bool:
