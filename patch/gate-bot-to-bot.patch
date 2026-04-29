@@ -1,0 +1,13 @@
+--- a/openclaw-lark/src/messaging/inbound/gate.js
++++ b/openclaw-lark/src/messaging/inbound/gate.js
+@@ -168,7 +168,9 @@ function evaluateGate(params) {
+         groupIdCaseInsensitive: true,
+         requireMentionOverride: accountFeishuCfg?.requireMention,
+     });
+-    if (requireMention && !(0, mention_1.mentionedBot)(ctx)) {
++    // Allow bot-sent messages to bypass mention requirement (bot-to-bot collaboration)
++    const senderIsBot = ctx.rawSender?.sender_type === 'app';
++    if (requireMention && !(0, mention_1.mentionedBot)(ctx) && !senderIsBot) {
+         // Check if @all mention should bypass the mention requirement
+         if (ctx.mentionAll) {
+             const respondToAll = resolveRespondToMentionAll({
