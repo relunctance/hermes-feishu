@@ -72,7 +72,38 @@ bash ~/repos/hermes-feishu/scripts/apply-patch.sh
 ```
 
 ## 注意事项
+## 已知限制（2026-04-29）
 
+### wk-hermes / mao 不响应排查路径
+
+wk-hermes 和 mao 对 @mention 无响应，但 bailong-hermes 正常。排查顺序：
+
+1. **确认 bot 是否在群里** — 在飞书管理后台检查 bot 是否被添加到对应群
+2. **确认 WebSocket 订阅** — wk-hermes/mao 的 Feishu WebSocket 是否真的订阅了该群（不是只改 config.yaml 就生效）
+3. **检查日志** — bailong-hermes 的日志在 `~/.hermes/logs/agent.log`，wk-hermes 的日志路径需向 wukong 确认
+4. **对比实验** — 在已知正常的群（oc_629f6534bd95cc0730b791f8a1456397）发消息测试
+5. **群 ID 是否一致** — 不同 bot 的 app_token 不同，同一个群对不同 bot 的 chat_id 可能不同
+
+### env 不生效的坑
+
+`FEISHU_FREE_RESPONSE_CHATS` / `FEISHU_FREE_RESPONSE_CHANNELS` 是**旧版 openclaw** 的变量，**不影响 Hermes bailong** 的行为。 Hermes 的免@配置只在 `config.yaml` 的 `group_rules[chat_id].at_only: false`。
+
+### 飞书 bot 身份查询
+
+```bash
+BOT_TOKEN=$(curl -s -X POST 'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal' \
+  -H 'Content-Type: application/json' \
+  -d '{"app_id": "<APP_ID>", "app_secret": "<APP_SECRET>"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["tenant_access_token"])')
+curl -s "https://open.feishu.cn/open-apis/bot/v3/info" -H "Authorization: Bearer $BOT_TOKEN"
+```
+
+### 当前状态（2026-04-29）
+
+- bailong-hermes：`at_only: false`，免@响应正常 ✓
+- wk-hermes：配置正确但未确认是否收得到 oc_22e019265c6096916f5a78de44f3cdea 的消息
+- mao：未确认是否在 oc_22e019265c6096916f5a78de44f3cdea 群
+
+## 注意事项
 - openclaw 已卸载（2026-04-29），补丁存放在 `~/repos/hermes-feishu/patch/`
 - 如果重装 openclaw，需重新安装 openclaw-lark 扩展
 - 不需要重新编译，src 目录的 .js 文件是直接运行时代码
